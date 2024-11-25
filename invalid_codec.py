@@ -269,7 +269,46 @@ class AdvancedEncodingDetector:
         
         self.setup_logging()
         self.renamer = FileRenamer(self.logger)
+        self.non_ascii_pattern = re.compile(r'[^\x00-\x7F]+')
         
+    def remove_ascii_and_english(self, text: str) -> str:
+        """移除ASCII字符和英文，保留非ASCII字符"""
+        # 只保留非ASCII字符
+        return ''.join(char for char in text if ord(char) > 127)
+    def get_clean_name_for_confidence(self, path: Path) -> str:
+        """获取用于计算置信度的清理后的名称"""
+        if path.is_file():
+            # 对于文件，只使用文件名（不含扩展名）
+            name = path.stem
+        else:
+            # 对于文件夹，使用完整名称
+            name = path.name
+            
+        # 移除ASCII字符和英文
+        return self.remove_ascii_and_english(name)
+    def calculate_text_features(self, text: str) -> Dict[str, float]:
+        """计算文本的特征"""
+        # 只对非ASCII部分计算特征
+        clean_text = self.remove_ascii_and_english(text)
+        if not clean_text:
+            return {
+                'entropy': 0.0,
+                'jp_char_ratio': 0.0,
+                'pattern_match': 0.0,
+                'non_ascii_ratio': 0.0
+            }
+            
+        return {
+            'entropy': self.calculate_text_entropy(clean_text),
+            'jp_char_ratio': self.get_character_ratio(
+                clean_text, 
+                [(0x3040, 0x309F),  # 平假名
+                 (0x30A0, 0x30FF),  # 片假名
+                 (0x4E00, 0x9FFF)]  # 汉字
+            ),
+            'pattern_match': self.calculate_pattern_matches(clean_text),
+            'non_ascii_ratio': len(clean_text) / len(text) if text else 0
+        }
     def setup_logging(self):
         """设置日志系统"""
         self.logger = logging.getLogger(__name__)
@@ -311,33 +350,20 @@ class AdvancedEncodingDetector:
         
         for source_enc, target_enc in self.encoding_pairs:
             try:
-                # 尝试用目标编码转换为bytes，再用源编码解码
                 bytes_data = filename.encode(target_enc)
                 decoded = bytes_data.decode(source_enc)
                 
-                # 过滤掉解码结果完全相同的情况
                 if decoded == filename:
                     continue
+                    
+                # 使用清理后的文本计算特征
+                features = self.calculate_text_features(decoded)
                 
-                # 计算特征
-                features = {
-                    'entropy': self.calculate_text_entropy(decoded),
-                    'jp_char_ratio': self.get_character_ratio(
-                        decoded, 
-                        [(0x3040, 0x309F),  # 平假名
-                         (0x30A0, 0x30FF),  # 片假名
-                         (0x4E00, 0x9FFF)]  # 汉字
-                    ),
-                    'pattern_match': self.calculate_pattern_matches(decoded),
-                    'similarity': jellyfish.jaro_winkler_similarity(filename, decoded)
-                }
-                
-                # 计算综合置信度
+                # 更新置信度计算
                 confidence = (
-                    features['jp_char_ratio'] * 0.4 +
+                    features['jp_char_ratio'] * 0.5 +
                     features['pattern_match'] * 0.3 +
-                    (1 - features['similarity']) * 0.2 +
-                    min(features['entropy'] / 4, 1.0) * 0.1
+                    features['non_ascii_ratio'] * 0.2
                 )
                 
                 candidates.append(EncodingCandidate(
@@ -351,7 +377,6 @@ class AdvancedEncodingDetector:
                 continue
                 
         return sorted(candidates, key=lambda x: x.confidence, reverse=True)
-
     def analyze_file(self, filepath: Path) -> Dict:
         """分析单个文件"""
         try:
@@ -384,28 +409,42 @@ class AdvancedEncodingDetector:
     def analyze_path(self, path: Path) -> Dict:
         """分析路径（文件或文件夹）"""
         try:
-            name = path.name
-            candidates = self.detect_encoding_candidate(name)
+            clean_name = self.get_clean_name_for_confidence(path)
+            
+            # 如果清理后的名称为空，跳过这个文件/文件夹
+            if not clean_name:
+                return None
+                
+            candidates = self.detect_encoding_candidate(path.name)
             
             if not candidates:
                 return None
                 
             best_candidate = candidates[0]
             
+            # 使用清理后的文本计算特征
+            features = self.calculate_text_features(best_candidate.decoded_text)
+            
+            # 更新置信度计算
+            confidence = (
+                features['jp_char_ratio'] * 0.5 +  # 增加日文字符比例的权重
+                features['pattern_match'] * 0.3 +
+                features['non_ascii_ratio'] * 0.2   # 添加非ASCII字符比例
+            )
+            
             # 当启用强制转换时，忽略置信度检查
-            if self.force_convert or best_candidate.confidence > 0.5:
+            if self.force_convert or confidence > 0.5:
                 return {
                     'path': str(path),
-                    'original_name': name,
+                    'original_name': path.name,
                     'detected_encoding': best_candidate.encoding,
                     'suggested_name': best_candidate.decoded_text,
-                    'confidence': best_candidate.confidence,
-                    'features': best_candidate.features
+                    'confidence': confidence,
+                    'features': features
                 }
         except Exception as e:
             self.logger.error(f"处理路径 {path}时出错: {str(e)}")
         return None
-
     def scan_directory(self, min_confidence: float = 0.5) -> List[Dict]:
         """扫描目录查找并可选择性地修复编码问题的文件和文件夹"""
         self.logger.info(f"开始扫描目录: {self.scan_path}")
