@@ -49,6 +49,7 @@ class FileRenamer:
         self.logger = logger
         self.is_windows = platform.system() == 'Windows'
         self.rename_history = []
+        self.pending_renames = []  # 存储待处理的重命名操作
 
     def sanitize_filename(self, filename: str) -> str:
         """净化文件名，移除不允许的字符"""
@@ -122,6 +123,25 @@ class FileRenamer:
                 f.write("-" * 80 + "\n\n")
             
         return history_file
+
+    def add_pending_rename(self, old_path: Path, new_name: str, depth: int):
+        """添加待处理的重命名操作"""
+        self.pending_renames.append({
+            'old_path': old_path,
+            'new_name': new_name,
+            'depth': depth
+        })
+
+    def process_pending_renames(self):
+        """处理待重命名操作，按深度从深到浅排序处理"""
+        # 按深度降序排序，确保先处理深层文件夹
+        self.pending_renames.sort(key=lambda x: (-x['depth'], str(x['old_path'])))
+        
+        for item in self.pending_renames:
+            self.rename_file(item['old_path'], item['new_name'])
+            
+        self.pending_renames.clear()
+
 
 class RenameRecovery:
     """重命名恢复处理类"""
@@ -223,9 +243,10 @@ class RenameRecovery:
                 f.write("-" * 80 + "\n\n")
 class AdvancedEncodingDetector:
     """高级编码检测类"""
-    def __init__(self, scan_path: str = None, auto_rename: bool = False):
+    def __init__(self, scan_path: str = None, auto_rename: bool = False, force_convert: bool = False):
         self.scan_path = Path(scan_path) if scan_path else Path.cwd()
         self.auto_rename = auto_rename
+        self.force_convert = force_convert  # 新增强制转换标志
         
         # 常见的日文文件名特征pattern
         self.jp_patterns = [
@@ -356,19 +377,50 @@ class AdvancedEncodingDetector:
             self.logger.error(f"处理文件 {filepath}时出错: {str(e)}")
         return None
 
+    def get_path_depth(self, path: Path) -> int:
+        """计算路径的深度"""
+        return len(path.relative_to(self.scan_path).parts)
+
+    def analyze_path(self, path: Path) -> Dict:
+        """分析路径（文件或文件夹）"""
+        try:
+            name = path.name
+            candidates = self.detect_encoding_candidate(name)
+            
+            if not candidates:
+                return None
+                
+            best_candidate = candidates[0]
+            
+            # 当启用强制转换时，忽略置信度检查
+            if self.force_convert or best_candidate.confidence > 0.5:
+                return {
+                    'path': str(path),
+                    'original_name': name,
+                    'detected_encoding': best_candidate.encoding,
+                    'suggested_name': best_candidate.decoded_text,
+                    'confidence': best_candidate.confidence,
+                    'features': best_candidate.features
+                }
+        except Exception as e:
+            self.logger.error(f"处理路径 {path}时出错: {str(e)}")
+        return None
+
     def scan_directory(self, min_confidence: float = 0.5) -> List[Dict]:
-        """扫描目录查找并可选择性地修复编码问题的文件"""
+        """扫描目录查找并可选择性地修复编码问题的文件和文件夹"""
         self.logger.info(f"开始扫描目录: {self.scan_path}")
         results = []
-        renamed_count = 0
         
         try:
             with ThreadPoolExecutor() as executor:
                 futures = []
                 
-                for filepath in self.scan_path.rglob('*'):
-                    if filepath.is_file():
-                        futures.append(executor.submit(self.analyze_file, filepath))
+                # 获取所有路径（包括文件和文件夹）
+                all_paths = list(self.scan_path.rglob('*'))
+                
+                # 先分析所有路径
+                for path in all_paths:
+                    futures.append(executor.submit(self.analyze_path, path))
                 
                 for future in futures:
                     try:
@@ -376,20 +428,20 @@ class AdvancedEncodingDetector:
                         if result:
                             results.append(result)
                             
-                            # 如果启用了自动重命名，尝试重命名文件
-                            if self.auto_rename and result['confidence'] >= min_confidence:
-                                old_path = Path(result['path'])
-                                new_name = result['suggested_name']
-                                
-                                if self.renamer.rename_file(old_path, new_name):
-                                    renamed_count += 1
+                            # 如果启用了自动重命名，添加到待处理队列
+                            if self.auto_rename and (self.force_convert or result['confidence'] >= min_confidence):
+                                path = Path(result['path'])
+                                depth = self.get_path_depth(path)
+                                self.renamer.add_pending_rename(path, result['suggested_name'], depth)
                                 
                     except Exception as e:
                         self.logger.error(f"处理结果时出错: {str(e)}")
+                
+                # 处理所有待重命名操作
+                if self.auto_rename:
+                    self.renamer.process_pending_renames()
             
-            self.logger.info(f"扫描完成，找到 {len(results)} 个可能存在编码问题的文件")
-            if self.auto_rename:
-                self.logger.info(f"成功重命名 {renamed_count} 个文件")
+            self.logger.info(f"扫描完成，找到 {len(results)} 个可能存在编码问题的路径")
             
         except Exception as e:
             self.logger.error(f"扫描过程中出错: {str(e)}")
@@ -410,6 +462,8 @@ class EncodingDetectorCLI:
                           help='最小置信度阈值 (0-1), 默认为0.5')
         parser.add_argument('--auto-rename', action='store_true',
                           help='自动重命名检测到的问题文件（默认关闭）')
+        parser.add_argument('--force', action='store_true',
+                          help='强制转换所有文件夹名字和文件名为日文，忽略置信度检查')
         parser.add_argument('--recovery',
                           help='指定重命名日志文件路径（用于恢复操作）')
         parser.add_argument('--reverse', action='store_true',
@@ -493,12 +547,22 @@ def main():
                     
             logger.info(f"恢复操作完成: 成功恢复 {success_count}/{len(records)} 个文件")
             
+            # 保存恢复日志
+            recovery.save_recovery_log(rename_output_dir)
+            
         else:
-            detector = AdvancedEncodingDetector(args.path, args.auto_rename)
+            # 初始化检测器，传入force参数
+            detector = AdvancedEncodingDetector(
+                args.path, 
+                args.auto_rename,
+                args.force
+            )
+            
+            # 执行扫描
             results = detector.scan_directory(min_confidence=args.confidence)
             
             if not results:
-                print("未发现疑似编码问题的文件名")
+                print("未发现疑似编码问题的文件或文件夹")
                 return
             
             # 生成扫描报告
@@ -507,35 +571,88 @@ def main():
                 f.write(f"文件名编码问题扫描报告\n")
                 f.write(f"扫描时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"扫描目录: {args.path or os.getcwd()}\n")
+                f.write(f"强制转换模式: {'开启' if args.force else '关闭'}\n")
+                f.write(f"置信度阈值: {args.confidence if not args.force else '已忽略'}\n")
                 f.write("-" * 80 + "\n\n")
                 
-                for item in sorted(results, key=lambda x: x['confidence'], reverse=True):
-                    f.write(f"文件: {item['original_name']}\n")
-                    f.write(f"建议改为: {item['suggested_name']}\n")
-                    f.write(f"置信度: {item['confidence']:.2%}\n")
-                    f.write("-" * 80 + "\n")
+                # 分别统计文件和文件夹的数量
+                file_count = sum(1 for item in results if Path(item['path']).is_file())
+                dir_count = sum(1 for item in results if Path(item['path']).is_dir())
                 
-            print(f"\n发现 {len(results)} 个可能存在编码问题的文件:")
+                f.write(f"发现问题文件: {file_count} 个\n")
+                f.write(f"发现问题文件夹: {dir_count} 个\n")
+                f.write("-" * 80 + "\n\n")
+                
+                # 先输出文件夹信息
+                if dir_count > 0:
+                    f.write("问题文件夹列表:\n")
+                    for item in sorted(results, key=lambda x: x['confidence'], reverse=True):
+                        if Path(item['path']).is_dir():
+                            f.write(f"文件夹: {item['original_name']}\n")
+                            f.write(f"建议改为: {item['suggested_name']}\n")
+                            f.write(f"置信度: {item['confidence']:.2%}\n")
+                            f.write("-" * 80 + "\n")
+                    f.write("\n")
+                
+                # 再输出文件信息
+                if file_count > 0:
+                    f.write("问题文件列表:\n")
+                    for item in sorted(results, key=lambda x: x['confidence'], reverse=True):
+                        if Path(item['path']).is_file():
+                            f.write(f"文件: {item['original_name']}\n")
+                            f.write(f"建议改为: {item['suggested_name']}\n")
+                            f.write(f"置信度: {item['confidence']:.2%}\n")
+                            f.write("-" * 80 + "\n")
+            
+            # 控制台输出摘要信息
+            print(f"\n发现 {len(results)} 个可能存在编码问题的路径:")
+            print(f"- 问题文件夹: {dir_count} 个")
+            print(f"- 问题文件: {file_count} 个")
             print(f"详细报告已保存至: {report_file}")
             
             if args.auto_rename:
                 print(f"重命名日志保存至: {args.recovery}")
             
-            print("-" * 80)
+            print("\n" + "-" * 80 + "\n")
             
-            for item in sorted(results, key=lambda x: x['confidence'], reverse=True):
-                print(f"文件: {item['original_name']}")
-                print(f"建议改为: {item['suggested_name']}")
-                print(f"置信度: {item['confidence']:.2%}")
-                print("-" * 80)
+            # 控制台输出概要信息
+            # 先显示文件夹
+            if dir_count > 0:
+                print("问题文件夹:")
+                for item in sorted(results, key=lambda x: x['confidence'], reverse=True):
+                    if Path(item['path']).is_dir():
+                        print(f"文件夹: {item['original_name']}")
+                        print(f"建议改为: {item['suggested_name']}")
+                        print(f"置信度: {item['confidence']:.2%}")
+                        print("-" * 80)
+                print()
+            
+            # 再显示文件
+            if file_count > 0:
+                print("问题文件:")
+                for item in sorted(results, key=lambda x: x['confidence'], reverse=True):
+                    if Path(item['path']).is_file():
+                        print(f"文件: {item['original_name']}")
+                        print(f"建议改为: {item['suggested_name']}")
+                        print(f"置信度: {item['confidence']:.2%}")
+                        print("-" * 80)
             
             # 如果启用了自动重命名，保存重命名历史
             if args.auto_rename:
                 detector.renamer.save_rename_history(Path(args.recovery))
                 
+    except KeyboardInterrupt:
+        logger.info("用户中断执行")
+        print("\n操作已取消")
     except Exception as e:
         logger.error(f"执行过程中出错: {str(e)}")
+        print(f"\n执行过程中出错: {str(e)}")
         raise
-
+    finally:
+        # 如果没有任何输出文件，删除创建的空目录
+        if not any(scan_output_dir.iterdir()):
+            scan_output_dir.rmdir()
+        if not any(rename_output_dir.iterdir()):
+            rename_output_dir.rmdir()
 if __name__ == "__main__":
     main()
