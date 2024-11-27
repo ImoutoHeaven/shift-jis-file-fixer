@@ -1,0 +1,7 @@
+fugashi==1.2.1
+unidic-lite==1.0.8
+sudachipy==0.6.7
+sudachidict-core==20230927
+jamdict==0.1.10
+jellyfish==1.0.1
+langdetect==1.0.9
